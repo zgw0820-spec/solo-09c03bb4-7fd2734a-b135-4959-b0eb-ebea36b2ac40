@@ -140,6 +140,56 @@ def main() -> int:
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
 
+    print("[6] cabinet samples: intake rules, idempotency and pending verdict")
+    from datetime import UTC, datetime
+
+    def iso_at(offset_seconds: float) -> str:
+        return (
+            datetime.fromtimestamp(datetime.now(UTC).timestamp() + offset_seconds, tz=UTC)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    cabinet = f"{RUN}-CAB"
+    status, body = call(
+        "POST", f"{API}/cabinets/{cabinet}/samples",
+        {"sampled_at": iso_at(5), "temperature_c": 50.0},
+    )
+    check(status == 422, "future sample is rejected")
+    stamps = []
+    for offset, temp in [(-30, 71.0), (-20, 74.0), (-10, 78.0)]:
+        stamp = iso_at(offset)
+        stamps.append(stamp)
+        status, body = call(
+            "POST", f"{API}/cabinets/{cabinet}/samples",
+            {"sampled_at": stamp, "temperature_c": temp},
+        )
+        check(status == 202, f"hot sample at offset {offset}s accepted")
+    status, body = call(
+        "POST", f"{API}/cabinets/{cabinet}/samples",
+        {"sampled_at": stamps[-1], "temperature_c": 78.0},
+    )
+    check(status == 200 and body.get("deduplicated") is True, "identical resend is idempotent")
+    status, _ = call(
+        "POST", f"{API}/cabinets/{cabinet}/samples",
+        {"sampled_at": stamps[-1], "temperature_c": 79.0},
+    )
+    check(status == 409, "same instant with different temperature conflicts")
+    status, cabinet_view = call("GET", f"{API}/cabinets/{cabinet}")
+    check(
+        status == 200 and cabinet_view["status"] == "pending_verdict",
+        "cabinet shows a pending verdict while its window is open",
+    )
+    status, events = call("GET", f"{API}/thermal-events?cabinet_id={cabinet}")
+    check(
+        status == 200 and events["total"] == 1 and events["items"][0]["status"] == "pending",
+        "thermal event is pending and carries the open verdict",
+    )
+    check(
+        len(events["items"][0]["trigger_readings"]) == 3,
+        "the pending event records the three trigger readings",
+    )
+
     print("smoke test passed")
     return 0
 

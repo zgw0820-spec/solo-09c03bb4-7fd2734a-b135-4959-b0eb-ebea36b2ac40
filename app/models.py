@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -141,3 +142,79 @@ class HealthView(BaseModel):
     status: str
     database: str
     gateway_url: str
+
+
+# --------------------------------------------------------------------- thermal
+
+
+class SampleCreate(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "sampled_at": "2026-11-17T03:30:00.123Z",
+                "temperature_c": 74.5,
+            }
+        },
+    )
+
+    # Timezone-aware UTC timestamp produced by the collector. Naive datetimes
+    # are rejected so clock semantics never depend on an implicit zone.
+    sampled_at: datetime = Field(
+        description="Sampling time (timezone-aware ISO-8601, e.g. 2026-11-17T03:30:00Z)"
+    )
+    temperature_c: float = Field(ge=-100.0, le=500.0, description="Cabinet temperature in degrees Celsius")
+
+
+class SampleView(BaseModel):
+    cabinet_id: str
+    sampled_at: str
+    temperature_c: float
+    received_at: str
+    deduplicated: bool = Field(description="True when an identical re-send reused the stored sample")
+
+
+class ThermalReadingView(BaseModel):
+    sampled_at: str
+    temperature_c: float
+    received_at: str
+
+
+class ThermalEventView(BaseModel):
+    event_no: str
+    cabinet_id: str
+    status: Literal["pending", "confirmed", "interrupted"]
+    status_text: str
+    first_sampled_at: str
+    last_sampled_at: str
+    window_closes_at: str
+    decided_at: str | None = None
+    interrupted_reason: str | None = None
+    # The readings the verdict was computed from (the qualifying hot streak).
+    trigger_readings: list[ThermalReadingView] = Field(default_factory=list)
+    # Set once the confirmed event's alarm exists.
+    alarm_no: str | None = None
+    alarm: dict[str, Any] | None = Field(
+        default=None, description="Linked alarm snapshot, once the event has been confirmed"
+    )
+
+
+class ThermalEventList(BaseModel):
+    items: list[ThermalEventView]
+    total: int
+
+
+class CabinetView(BaseModel):
+    cabinet_id: str
+    # monitoring | pending_verdict | triggered | cooldown
+    status: str
+    status_text: str
+    armed: bool = Field(description="False while a confirmed event is waiting for a sub-65C cooling reading")
+    sample_count: int
+    last_sample: ThermalReadingView | None = None
+    current_hot_streak: int = Field(description="Length of the current qualifying hot streak (0 when broken)")
+    open_event: ThermalEventView | None = Field(
+        default=None, description="Present only while a verdict window is still open (pending)"
+    )
+    latest_confirmed_event_no: str | None = None
+    window_seconds: float

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 
 from . import __version__
 from .config import Settings
@@ -17,12 +17,23 @@ from .gateway_client import GatewayClient
 from .models import (
     AlarmCreate,
     AlarmView,
+    CabinetView,
     ConfirmRequest,
     HealthView,
     NotificationList,
     NotificationView,
+    SampleCreate,
+    SampleView,
+    ThermalEventList,
+    ThermalEventView,
 )
 from .service import AlarmService, ConflictError, NotFoundError
+from .thermal import (
+    CabinetNotFoundError,
+    RejectedSampleError,
+    SampleConflictError,
+    ThermalService,
+)
 from .worker import Dispatcher
 
 log = logging.getLogger("alarm")
@@ -41,6 +52,7 @@ async def lifespan(app: FastAPI):
     )
     db = Database(settings.database_path)
     service = AlarmService(db)
+    thermal = ThermalService(db, settings, service)
     gateway = GatewayClient(
         settings.gateway_url,
         post_timeout=settings.post_timeout_seconds,
@@ -55,9 +67,12 @@ async def lifespan(app: FastAPI):
         max_backoff_seconds=settings.max_backoff_seconds,
         max_concurrency=settings.delivery_concurrency,
         not_found_misses_before_repost=settings.not_found_misses_before_repost,
+        thermal_service=thermal,
+        thermal_interval=settings.thermal_tick_interval_seconds,
     )
     app.state.db = db
     app.state.service = service
+    app.state.thermal = thermal
     app.state.gateway = gateway
     app.state.dispatcher = dispatcher
     if settings.recover_inflight_on_startup:
@@ -79,9 +94,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=__version__,
         description=(
             "供电柜过热告警的升级通知 API。\n\n"
-            "**流程**：提交告警（主值班员通知）→ 网关确已受理后开始计入确认期限 → "
+            "**流程**：柜温采样（`/cabinets/{id}/samples`）→ 连续三笔 ≥70°C 且相邻间隔 "
+            "≤60 秒触发过热事件（120 秒窗口内允许乱序，窗口未关仅为待定）→ "
+            "确认事件创建一条告警并通知主值班员 → 网关确已受理后开始计入确认期限 → "
             "逾期未确认仅投递一次备班通知；确认后不再创建新的备班投递。\n\n"
             "**关键语义**\n"
+            "- 同柜同采样时刻同温度重送幂等；异温度拒绝（409）；超出 120 秒窗口的采样拒绝（422）。\n"
+            "- 过热事件在判定窗口关闭后结论不可被旧样本改写；迟到的低温读数只能打断尚未关窗的连续高温。\n"
             "- 同一告警号 + 相同内容的重试幂等复用原告警；内容不一致返回 409。\n"
             "- 主通知只有拿到网关的受理确认才开始计时；回执不明标记为 "
             "`receipt_unconfirmed`，查明前绝不触发升级。\n"
@@ -251,6 +270,135 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if status_filter:
             views = [v for v in views if v["status"] == status_filter]
         return {"items": views, "total": len(views)}
+
+    # ------------------------------------------------------------- thermal API
+
+    thermal_tags = ["柜温过热判定"]
+
+    @app.post(
+        "/cabinets/{cabinet_id}/samples",
+        response_model=SampleView,
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=thermal_tags,
+        summary="上传柜温采样",
+        description=(
+            "采集端按柜号上传采样时间（时区感知 ISO-8601）与摄氏温度。\n\n"
+            "- 只接收距接收时刻不超过 120 秒（`THERMAL_SAMPLE_WINDOW_SECONDS`）的采样，"
+            "允许乱序；未来时间与过旧采样返回 422。\n"
+            "- 同柜同采样时刻同温度重送幂等（200，不重复计数）；同柜同时刻异温度返回 409。\n"
+            "- 上传后立即重算该柜的开放判定窗口；窗口未关时只展示待定，结论由后台关窗后落定。"
+        ),
+        responses={
+            200: {"description": "完全相同的采样重送，复用已存储记录"},
+            409: {"description": "同柜同采样时刻但温度不同"},
+            422: {"description": "采样超出 120 秒接收窗口或时间格式非法"},
+        },
+    )
+    async def submit_sample(
+        cabinet_id: str,
+        payload: SampleCreate,
+        request: Request,
+        response: Response,
+        x_test_now_epoch: str | None = Header(default=None, include_in_schema=False),
+    ) -> dict:
+        cabinet_id = cabinet_id.strip()
+        if not cabinet_id or len(cabinet_id) > 40:
+            raise HTTPException(status_code=422, detail="cabinet_id 长度需在 1~40 之间")
+        thermal: ThermalService = request.app.state.thermal
+        if payload.sampled_at.tzinfo is None:
+            raise HTTPException(status_code=422, detail="sampled_at 必须带时区（UTC）")
+        sampled_real = payload.sampled_at.timestamp()
+        now_real: float | None = None
+        if x_test_now_epoch is not None:
+            if not request.app.state.settings.allow_test_clock:
+                raise HTTPException(
+                    status_code=400,
+                    detail="X-Test-Now-Epoch 仅在 ALLOW_TEST_CLOCK=true 的测试环境可用",
+                )
+            try:
+                now_real = float(x_test_now_epoch)
+            except ValueError:
+                raise HTTPException(
+                    status_code=422, detail="X-Test-Now-Epoch 必须是 epoch 秒数值"
+                ) from None
+        try:
+            row = thermal.ingest_sample(
+                cabinet_id, sampled_real, payload.temperature_c, now_real=now_real
+            )
+        except RejectedSampleError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except SampleConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if row["deduplicated"]:
+            response.status_code = status.HTTP_200_OK
+        return {
+            "cabinet_id": cabinet_id,
+            "sampled_at": row["sampled_at"],
+            "temperature_c": row["temperature_c"],
+            "received_at": row["received_at"],
+            "deduplicated": row["deduplicated"],
+        }
+
+    @app.get(
+        "/cabinets",
+        tags=thermal_tags,
+        summary="列出有采样的柜号及其过热判定状态",
+    )
+    async def list_cabinets(request: Request) -> dict:
+        thermal: ThermalService = request.app.state.thermal
+        items = thermal.list_cabinets()
+        return {"items": items, "total": len(items)}
+
+    @app.get(
+        "/cabinets/{cabinet_id}",
+        response_model=CabinetView,
+        tags=thermal_tags,
+        summary="查询单柜状态（当前连续高温、待定事件、布防状态）",
+        responses={404: {"description": "该柜号没有任何采样"}},
+    )
+    async def get_cabinet(cabinet_id: str, request: Request) -> dict:
+        thermal: ThermalService = request.app.state.thermal
+        try:
+            return thermal.cabinet_snapshot(cabinet_id)
+        except CabinetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"cabinet {cabinet_id!r} not found") from exc
+
+    @app.get(
+        "/thermal-events",
+        response_model=ThermalEventList,
+        tags=thermal_tags,
+        summary="查询过热事件（可按柜号/状态过滤）",
+        description=(
+            "返回每个事件判定所用的读数 `trigger_readings` 及关联告警 `alarm`。"
+            "状态：pending（窗口未关，仅为待定）/ confirmed（已确认并建告警）/ "
+            "interrupted（窗口关闭前被迟到低温等打断，未成立）。"
+        ),
+    )
+    async def list_thermal_events(
+        request: Request,
+        cabinet_id: str | None = Query(default=None),
+        status_filter: str | None = Query(default=None, alias="status"),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict:
+        thermal: ThermalService = request.app.state.thermal
+        items = thermal.list_events(
+            cabinet_id=cabinet_id, status_filter=status_filter, limit=limit
+        )
+        return {"items": items, "total": len(items)}
+
+    @app.get(
+        "/thermal-events/{event_no}",
+        response_model=ThermalEventView,
+        tags=thermal_tags,
+        summary="查询单个过热事件（含判定读数与关联告警）",
+        responses={404: {"description": "事件不存在"}},
+    )
+    async def get_thermal_event(event_no: str, request: Request) -> dict:
+        thermal: ThermalService = request.app.state.thermal
+        try:
+            return thermal.get_event(event_no)
+        except CabinetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"thermal event {event_no!r} not found") from exc
 
     return app
 

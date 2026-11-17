@@ -95,6 +95,57 @@ CREATE TABLE IF NOT EXISTS events (
     kind        TEXT NOT NULL,
     detail      TEXT
 );
+
+-- Cabinet temperature samples. (cabinet_id, sampled_real) is the natural
+-- idempotency key: an exact re-send (same temperature) is a no-op, a
+-- re-send with a different temperature is rejected before insert.
+CREATE TABLE IF NOT EXISTS temp_samples (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cabinet_id      TEXT NOT NULL,
+    sampled_at      TEXT NOT NULL,
+    sampled_real    REAL NOT NULL,
+    temperature_c   REAL NOT NULL,
+    received_at     TEXT NOT NULL,
+    received_real   REAL NOT NULL,
+    UNIQUE(cabinet_id, sampled_real)
+);
+
+CREATE INDEX IF NOT EXISTS ix_temp_samples_cabinet_time
+    ON temp_samples(cabinet_id, sampled_real);
+
+-- Persistent overheating verdicts. A streak_key deterministically identifies a
+-- hot streak (cabinet + sampled time of its first reading), so re-evaluating
+-- the same samples after a restart can never create a second event or alarm.
+CREATE TABLE IF NOT EXISTS thermal_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_no            TEXT NOT NULL UNIQUE,
+    cabinet_id          TEXT NOT NULL,
+    streak_key          TEXT NOT NULL,
+    -- pending    : three qualifying hot readings seen, verdict window still open
+    -- confirmed  : window closed; the single linked alarm is (being) created
+    -- interrupted: a late low/cooling reading broke the streak before closing
+    status              TEXT NOT NULL CHECK (status IN ('pending','confirmed','interrupted')),
+    first_sampled_at    TEXT NOT NULL,
+    first_sampled_real  REAL NOT NULL,
+    last_sampled_at     TEXT NOT NULL,
+    last_sampled_real   REAL NOT NULL,
+    -- The verdict becomes immutable once this watermark has been reached.
+    window_closes_real   REAL NOT NULL,
+    decided_at          TEXT,
+    decided_real        REAL,
+    trigger_readings_json TEXT NOT NULL DEFAULT '[]',
+    alarm_no            TEXT,
+    interrupted_reason  TEXT,
+    created_at          TEXT NOT NULL,
+    created_real        REAL NOT NULL,
+    UNIQUE(cabinet_id, streak_key)
+);
+
+CREATE INDEX IF NOT EXISTS ix_thermal_events_cabinet
+    ON thermal_events(cabinet_id, id);
+
+CREATE INDEX IF NOT EXISTS ix_thermal_events_status
+    ON thermal_events(status);
 """
 
 

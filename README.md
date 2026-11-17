@@ -1,6 +1,12 @@
 # 机房告警升级 API
 
-供电柜过热告警的升级通知服务：**先通知主值班员 → 主通知确已受理才开始计时 →
+供电柜过热告警的升级通知服务。两条入口：
+
+1. **柜温采样自动判定**：采集端按柜号上传采样时间与摄氏温度，服务端识别持续过热，
+   确认的过热事件自动创建一条告警。
+2. **手工提交告警**：保留原有的 `POST /alarms` 人工提交通道。
+
+告警通知语义：**先通知主值班员 → 主通知确已受理才开始计时 →
 逾期未确认仅投递一次备班通知**。附带一个可设置慢响应、可丢回执的本地通知网关，
 用于演示和验证各种异常路径。
 
@@ -33,9 +39,48 @@ DATABASE_PATH=./data/alarms.db GATEWAY_URL=http://127.0.0.1:9000 \
 
 ## 核心语义
 
+### 0. 柜温采样与过热事件判定
+
+`POST /cabinets/{cabinet_id}/samples`：采集端按柜号上传 `sampled_at`（带时区的
+ISO-8601 UTC 时间）与 `temperature_c`（摄氏温度）。
+
+**接收窗口与乱序**
+
+- 只接收接收时刻之前 120 秒内的采样（`THERMAL_SAMPLE_WINDOW_SECONDS`）；未来时间、
+  老化达到 120 秒的采样返回 422。乱序上传允许，判定一律按采样时间排序后计算。
+- 同柜同采样时刻 + 同温度重送：返回 200 且 `deduplicated=true`，不重复计数。
+- 同柜同采样时刻 + 不同温度：返回 409，拒绝写入。
+
+**触发条件（按采样时间顺序的确定性归并）**
+
+- 温度 **≥ 70°C**（`THERMAL_HIGH_THRESHOLD_C`）记为高温读数；连续三笔高温、且每对
+  相邻读数间隔 **≤ 60 秒**（`THERMAL_MAX_GAP_SECONDS`）才构成候选连续高温。
+- 温度 **< 65°C**（`THERMAL_RESET_THRESHOLD_C`）的读数打断连续高温并重新布防；
+  65°C ≤ t < 70°C 的读数只打断连续高温、**不**重新布防。已确认一次事件后，必须等
+  到一笔真正低于 65°C 的读数，才允许再次触发。
+
+**判定窗口（待定 → 结论不可改写）**
+
+- 接收窗口 120 秒也是判定的不可变边界：水位线 `now - 120s` 之前不可能再有新采样。
+  候选连续高温的第一笔读数越过水位线时窗口关闭，事件由 `pending` 变为
+  `confirmed`（成立）或 `interrupted`（迟到的低温等在关窗前打断了连续高温）。
+- 窗口未关时，`GET /cabinets/{id}` 与 `GET /thermal-events` 只显示“待定”。
+- 关窗后旧样本无法再进入系统（接收时即 422），已落定的结论不可被改写。
+
+**事件与告警的关系**
+
+- 每个确认事件只创建**一条**告警：告警号由“柜号 + 连续高温首笔采样时间”确定性生成，
+  主备联系人与确认期限取自 Compose 环境配置（见下），通知、确认、逾期升级完全沿用
+  原有 `POST /alarms` 的状态机。
+- 关窗落库与建告警分开提交：判定先持久化，建告警失败或进程中断后，后台 tick 会按
+  确定性告警号幂等补建，不漏报、不重复通知。
+- `GET /thermal-events`（可按柜号、状态过滤）与 `GET /thermal-events/{event_no}`
+  返回判定所用的三笔读数 `trigger_readings` 以及关联告警快照 `alarm`。
+
 ### 1. 提交告警
 
 `POST /alarms`：告警号、告警内容、主/备联系人、确认期限（**2～30 秒**）。
+该手工接口完整保留，过热事件自动建告警走的也是同一条幂等提交逻辑。
 
 - 同一告警号 + **完全相同内容**的重试：返回 `200`，复用原告警，不重复通知。
 - 同一告警号但内容不同：返回 `409`。
@@ -99,7 +144,12 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| POST | `/alarms` | 提交告警（201；幂等重试 200；内容冲突 409） |
+| POST | `/cabinets/{cabinet_id}/samples` | 上传柜温采样（202；同温重送 200；异温 409；超窗 422） |
+| GET | `/cabinets` | 列出有采样的柜号及判定状态 |
+| GET | `/cabinets/{cabinet_id}` | 单柜状态：连续高温长度、待定事件、布防/冷却状态 |
+| GET | `/thermal-events` | 过热事件列表（`?cabinet_id=&status=` 过滤） |
+| GET | `/thermal-events/{event_no}` | 单事件：判定读数 + 关联告警快照 |
+| POST | `/alarms` | 手工提交告警（201；幂等重试 200；内容冲突 409） |
 | GET | `/alarms/{alarm_no}` | 告警、通知、确认、计时状态 |
 | POST | `/alarms/{alarm_no}/confirm` | 确认（幂等） |
 | GET | `/alarms/{alarm_no}/notifications` | 该告警的通知明细 |
@@ -107,7 +157,10 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 | GET | `/alarms` | 列出告警，可按 `status` 过滤 |
 | GET | `/health` | 健康检查 |
 
-状态值：`primary_queued`、`primary_sending`、`primary_unconfirmed`、
+热事件状态：`pending`（待定，窗口未关）、`confirmed`（已确认并建告警）、
+`interrupted`（关窗前被打断，未成立）。
+
+告警状态值：`primary_queued`、`primary_sending`、`primary_unconfirmed`、
 `primary_rejected`、`awaiting_confirmation`、`escalated`、`confirmed`、
 `confirmed_after_escalation`。
 
@@ -140,6 +193,17 @@ curl -X PUT localhost:9000/config -H 'content-type: application/json' \
 ## 演示
 
 ```bash
+# 0) 柜温：连续三笔 ≥70°C（相邻间隔 ≤60s），窗口未关前为待定，关窗后自动建一条告警
+for t in 71 74 78; do
+  TS=$(python3 -c "from datetime import UTC,datetime;print(datetime.now(UTC).isoformat(timespec='milliseconds').replace('+00:00','Z'))")
+  curl -s -X POST localhost:8000/cabinets/A07/samples -H 'content-type: application/json' \
+    -d "{\"sampled_at\":\"$TS\",\"temperature_c\":$t}"
+  sleep 1   # 真实采集端各自带采样时间戳，这里仅保证三笔采样时刻不同
+done
+curl -s localhost:8000/cabinets/A07 | python3 -m json.tool        # pending_verdict
+curl -s localhost:8000/thermal-events?cabinet_id=A07 | python3 -m json.tool
+# 约 120 秒后事件 confirmed，且 /thermal-events/{event_no} 内含关联告警与三笔读数
+
 # 1) 正常：3 秒内确认，不升级
 curl -X POST localhost:8000/alarms -H 'content-type: application/json' -d '{
   "alarm_no":"DEMO-1","content":"供电柜 A07 温度 78°C",
@@ -175,18 +239,31 @@ curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 | `NOT_FOUND_MISSES_BEFORE_REPOST` | `3` | 网关连续“无记录”多少次后才重投 |
 | `RECONCILE_ON_READ` | `true` | 查询时是否先向网关核对未知回执（只查不发） |
 | `RECOVER_INFLIGHT_ON_STARTUP` | `true` | 启动时把中断的在途通知转为待查 |
+| `THERMAL_SAMPLE_WINDOW_SECONDS` | `120` | 采样接收窗口，也是判定窗口；只收过去这么多秒内的采样 |
+| `THERMAL_HIGH_THRESHOLD_C` | `70` | 高温阈值（达到即计入连续高温） |
+| `THERMAL_RESET_THRESHOLD_C` | `65` | 重新布防阈值（严格低于该温度才算冷却） |
+| `THERMAL_CONSECUTIVE_REQUIRED` | `3` | 触发所需连续高温笔数 |
+| `THERMAL_MAX_GAP_SECONDS` | `60` | 连续高温相邻读数最大间隔 |
+| `THERMAL_TICK_INTERVAL_SECONDS` | `0.2` | 后台关窗/建告警 tick 间隔 |
+| `THERMAL_RETENTION_SECONDS` | 约 10 年 | 原始采样保留时长（事件读数随事件永久保留） |
+| `THERMAL_PRIMARY_CONTACT_NAME` / `_CHANNEL` / `_ADDRESS` | 主值班员 / app / 空 | 热事件告警的主联系人 |
+| `THERMAL_BACKUP_CONTACT_NAME` / `_CHANNEL` / `_ADDRESS` | 备班 / sms / 空 | 热事件告警的备联系人 |
+| `THERMAL_ACK_DEADLINE_SECONDS` | `10` | 热事件告警的确认期限（2～30） |
+| `ALLOW_TEST_CLOCK` | `false` | 测试专用：允许 `X-Test-Now-Epoch` 头覆盖接收时刻，生产保持关闭 |
 
 ## 测试
 
 ```bash
-python -m pytest -q                     # 27 个测试，进程内假网关，真实 SQLite 文件
+python -m pytest -q                     # 46 个测试，进程内假网关，真实 SQLite 文件
 API_URL=http://localhost:8000 GATEWAY_URL=http://localhost:9000 \
   python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟
 ```
 
 覆盖：幂等提交与 409、计时起点、确认阻断升级、逾期仅一次、回执不明不升级、
 回执补查不重复投递、重启接续（三种中断点）、确认 vs 到期竞态、慢投递不阻塞、
-拒收处理、在途备班如实披露、Swagger/OpenAPI。
+拒收处理、在途备班如实披露、Swagger/OpenAPI；以及柜温采样的窗口/乱序/幂等/异温
+拒绝、连续高温三笔与 60 秒间隔、65°C 重新布防、迟到低温打断、关窗后结论不可改写、
+关窗建告警的崩溃接续与重启幂等、后台自动关窗并恰好一次通知。
 
 ## 已知限制
 

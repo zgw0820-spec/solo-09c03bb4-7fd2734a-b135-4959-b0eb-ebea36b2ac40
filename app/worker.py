@@ -42,6 +42,8 @@ class Dispatcher:
         max_backoff_seconds: float = 1.0,
         max_concurrency: int = 8,
         not_found_misses_before_repost: int = 3,
+        thermal_service=None,
+        thermal_interval: float = 0.2,
     ):
         self.db = db
         self.service = service
@@ -53,6 +55,11 @@ class Dispatcher:
         # A "not found" lookup is ambiguous while the original POST might still
         # be running, so require several consecutive misses before re-posting.
         self.not_found_misses_before_repost = not_found_misses_before_repost
+        # Optional overheating detection. When present a fourth loop closes
+        # verdict windows and creates thermal alarms. It does pure DB work per
+        # tick; notification delivery remains the job of the other loops.
+        self.thermal_service = thermal_service
+        self.thermal_interval = thermal_interval
         self._tasks: list[asyncio.Task] = []
         self._delivery_tasks: set[asyncio.Task] = set()
         self._stop = asyncio.Event()
@@ -63,6 +70,9 @@ class Dispatcher:
         # When paused, no notification is handed to the gateway. Lets tests (and
         # maintenance) hold the outbox still.
         self.delivery_paused = False
+        # When paused, the thermal loop leaves verdict windows open; tests drive
+        # ThermalService.run_tick explicitly instead of waiting for wall clock.
+        self.thermal_paused = False
         # Observability for tests and operators.
         self.delivery_attempts = 0
         self.lookup_attempts = 0
@@ -74,6 +84,10 @@ class Dispatcher:
             asyncio.create_task(self._deadline_loop(), name="alarm-deadline"),
             asyncio.create_task(self._recovery_loop(), name="alarm-recovery"),
         ]
+        if self.thermal_service is not None:
+            self._tasks.append(
+                asyncio.create_task(self._thermal_loop(), name="alarm-thermal")
+            )
 
     def recover_interrupted(self) -> int:
         """Make notifications interrupted by a restart eligible immediately.
@@ -193,6 +207,31 @@ class Dispatcher:
             except Exception:
                 log.exception("recovery loop iteration failed")
             await self._sleep(max(0.0, 0.5 - (time.monotonic() - started)), False)
+
+    async def _thermal_loop(self) -> None:
+        """Close overheating verdict windows whose intake window has elapsed.
+
+        Every tick is derived entirely from persisted samples, so a restart
+        resumes the exact same verdicts. The tick itself is database-only; the
+        confirmed event's alarm is created through the normal submit path and
+        delivered asynchronously by the dispatch loop.
+        """
+        while not self._stop.is_set():
+            if not self.thermal_paused:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, self.thermal_service.run_tick
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("thermal loop iteration failed")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.thermal_interval)
+            except TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
 
     async def _sleep(self, seconds: float, worked: bool) -> None:
         # When there was work, loop again immediately (bounded by interval=0);

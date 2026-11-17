@@ -34,6 +34,20 @@ services:
       DELIVERY_LEASE_SECONDS: "10"
       RECONCILE_ON_READ: "true"
       LOG_LEVEL: info
+      # Overheating detection: contacts and confirmation deadline applied when
+      # a confirmed thermal event creates its single alarm. The manual
+      # POST /alarms endpoint still accepts per-request contacts and deadline.
+      THERMAL_SAMPLE_WINDOW_SECONDS: "120"
+      THERMAL_HIGH_THRESHOLD_C: "70"
+      THERMAL_RESET_THRESHOLD_C: "65"
+      THERMAL_CONSECUTIVE_REQUIRED: "3"
+      THERMAL_MAX_GAP_SECONDS: "60"
+      THERMAL_ACK_DEADLINE_SECONDS: "10"
+      THERMAL_PRIMARY_CONTACT_NAME: "主值班员 张工"
+      THERMAL_PRIMARY_CONTACT_CHANNEL: "app"
+      THERMAL_BACKUP_CONTACT_NAME: "备班 李工"
+      THERMAL_BACKUP_CONTACT_CHANNEL: "sms"
+      THERMAL_BACKUP_CONTACT_ADDRESS: "+8613800000000"
     volumes:
       - api-data:/srv/data
     ports:
